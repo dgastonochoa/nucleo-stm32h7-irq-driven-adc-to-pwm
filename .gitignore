@@ -1,0 +1,13 @@
+#
+# vscode
+#
+*.vscode/**
+
+#
+# others
+#
+**/build
+*.d
+*.o
+**/__pycache__
+.config
