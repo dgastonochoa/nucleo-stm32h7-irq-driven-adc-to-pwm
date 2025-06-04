@@ -75,7 +75,6 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
 static uint8_t duty_cycle = 25;
-static bool duty_cycle_increase = true;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -137,6 +136,7 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim6);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   HAL_StatusTypeDef rc = HAL_ADC_Start_IT(&hadc1);
   while (rc != HAL_OK) {
     rc = HAL_ADC_Start_IT(&hadc1);
@@ -149,31 +149,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    GPIO_PinState state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
-    if (state == GPIO_PIN_SET) {
-
-      HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
-
-      while (state == GPIO_PIN_SET) {
-        if (duty_cycle_increase) {
-          duty_cycle = duty_cycle == 50 ? duty_cycle : (duty_cycle + 5);
-        } else {
-          duty_cycle = duty_cycle == 0 ? duty_cycle : (duty_cycle - 5);
-        }
-
-        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, duty_cycle);
-
-        HAL_Delay(300);
-
-        state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
-      }
-
-      HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);
-
-      duty_cycle_increase = !duty_cycle_increase;
-    }
-
-    HAL_Delay(300);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -292,7 +267,7 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Channel = ADC_CHANNEL_18;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
@@ -438,7 +413,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 6399;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 4999;
+  htim3.Init.Period = 999;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -600,7 +575,6 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
@@ -652,12 +626,66 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/**
+ * Set the PWD duty cycle (0 - 100).
+ *
+ */
+static HAL_StatusTypeDef set_duty_cycle(uint8_t dc)
+{
+  if (dc > 100) {
+    return HAL_ERROR;
+  }
+
+  __disable_irq();
+
+  // The timer is configured so that a value of 50 in the CCR
+  // register leads to a 100% duty cycle. Thus, divide dc, which is
+  // [0-100] by 2 to get [0-50].
+  dc /= 2;
+
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, dc);
+
+  duty_cycle = dc;
+  __enable_irq();
+
+  return HAL_OK;
+}
+
+static uint8_t get_duty_cycle(void)
+{
+  __disable_irq();
+  uint8_t val = duty_cycle * 2;
+  __enable_irq();
+  return val;
+}
+
+static uint8_t adc_to_duty_cycle(uint8_t adc_val)
+{
+  // The ADC range is [0, ~2] V, which in raw ADC values is
+  // [0, ~150]. That needs to be parsed to [0-100] because a PWM
+  // duty cycle is 0 to 100%. Thus, [0-150] needs to be multplied
+  // by 1.5 or 3/2.
+  return (adc_val / 3) * 2;
+}
+
+static bool adc_val_within_range(uint8_t adc_val)
+{
+  // The ADC input range is [0, 3.3V]
+  // ADC data size is configured as 8 bits. So, each ADC unit represents
+  // 3.3 / 255 ~ 13 mV.
+  // The expected input range for this application is [~0, ~2] V, so the
+  // allowed range in terms of raw ADC values is:
+  const uint8_t lower_threshold = 0;
+  const uint8_t higher_threshold = 150;     // 2 / 13e-3   ~ 150
+
+  return (adc_val >= lower_threshold) && (adc_val <= higher_threshold);
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM6)
   {
-    __disable_irq();
-    if (duty_cycle == 50)
+    if (get_duty_cycle() > 90)
     {
       HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
     }
@@ -665,15 +693,26 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     {
       HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
     }
-    __enable_irq();
   }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1) {
-    uint32_t adcValue = HAL_ADC_GetValue(&hadc1);
-    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+    uint32_t adc_value = HAL_ADC_GetValue(&hadc1);
+    if (!adc_val_within_range((uint8_t)adc_value)) {
+      return;
+    }
+
+    uint8_t curr_duty_cycle = get_duty_cycle();
+    uint8_t new_duty_cycle = adc_to_duty_cycle(adc_value);
+
+    // Avoid the PWM signal to "flicker"
+    if (abs(new_duty_cycle - curr_duty_cycle) < 4) {
+      return;
+    }
+
+    set_duty_cycle(adc_to_duty_cycle(adc_value));
   }
 }
 /* USER CODE END 4 */
